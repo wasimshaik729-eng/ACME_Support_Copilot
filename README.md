@@ -19,7 +19,8 @@ py -3.12 -m ruff check .
 
 ## Seed data
 
-The project relies on `data/seed.json` for the initial seed data set. It should be treated as read-only and never edited by the application or tests.
+The project relies on `data/seed.json` for the initial seed data set. 
+It should be treated as read-only and never edited by the application or tests.
 
 ## Endpoints
 
