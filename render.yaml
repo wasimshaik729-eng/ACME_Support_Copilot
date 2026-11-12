@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: acme-support-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: ACME_AGENT_ALLOW_EXTERNAL_LLM
+        value: "false"
+
+  - type: web
+    name: acme-support-ui
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: /bin/sh -c 'python -m streamlit run streamlit_app.py --server.address 0.0.0.0 --server.port "$PORT"'
+    envVars:
+      - key: ACME_API_URL
+        fromService:
+          type: web
+          name: acme-support-api
+          envVarKey: RENDER_EXTERNAL_URL

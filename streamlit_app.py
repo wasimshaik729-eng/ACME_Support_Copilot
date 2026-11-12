@@ -2,21 +2,24 @@
 
 from __future__ import annotations
 
-import os
 import html
+import os
+import uuid
 from datetime import date, timedelta
 
 import pandas as pd
 import requests
 import streamlit as st
 
+from app.agent_graph import (
+    build_support_graph,
+    resume_approved_action,
+    run_investigation,
+)
 from app.support_agent import (
-    analyze_ticket,
+    PolicyPassage,
     external_model_available,
-    generate_model_reply,
-    local_reply,
     make_case_brief,
-    retrieve_policy,
 )
 
 ORDER_STATUSES = ("placed", "shipped", "delivered", "returned", "refunded")
@@ -25,6 +28,12 @@ TICKET_PRIORITIES = ("low", "medium", "high")
 TICKET_CHANNELS = ("email", "chat", "whatsapp", "phone")
 ORDER_NEXT = dict(zip(ORDER_STATUSES, ORDER_STATUSES[1:]))
 DEFAULT_API_URL = os.getenv("ACME_API_URL", "http://127.0.0.1:8000")
+
+
+@st.cache_resource(show_spinner=False)
+def get_support_graph(api_url: str):
+    return build_support_graph(api_url)
+
 
 st.set_page_config(
     page_title="Acme Support Workspace",
@@ -496,60 +505,66 @@ try:
     elif selected_page == "Agent desk":
         page_header(
             "Agent desk",
-            "Investigate a ticket with retrieved policy context and prepare an approved next step.",
+            "Investigate with policy-grounded RAG, then approve a guarded workflow action.",
         )
         st.info(
-            "The agent can read records and draft replies. It cannot send messages or move money. "
-            "A refund status update only records the demo workflow state."
+            "The agent can read support records and draft a reply. It cannot send messages or move money. "
+            "Recording a refunded status changes workflow state only; it is not proof of payment."
         )
         with st.form("agent_ticket_lookup"):
             agent_ticket_id = st.number_input("Ticket ID", min_value=1, step=1)
             order_override = st.text_input(
                 "Order ID if the ticket is not linked", placeholder="Optional"
             )
+            action_labels = {
+                "Investigate only": None,
+                "Take ticket": "take_ticket",
+                "Record refund workflow status": "record_refund_status",
+                "Resolve ticket": "resolve_ticket",
+            }
+            action_label = st.selectbox("Proposed action", list(action_labels), index=0)
+            use_external_model = False
+            if external_model_available():
+                use_external_model = st.checkbox(
+                    "Allow this ticket and order data to be sent to the configured model provider",
+                    value=False,
+                )
             analyze_submitted = st.form_submit_button(
                 "Investigate ticket", type="primary"
             )
         if analyze_submitted:
-            st.session_state["agent_ticket"] = api_request(
-                backend_url, "GET", f"/tickets/{int(agent_ticket_id)}"
-            )
-            st.session_state["agent_order_override"] = order_override.strip()
-            st.session_state.pop("agent_draft_ticket_id", None)
-
-        ticket = st.session_state.get("agent_ticket")
-        if ticket:
-            customer = api_request(
-                backend_url, "GET", f"/customers/{ticket['customer_id']}"
-            )
-            linked_order_id = ticket.get("order_id") or st.session_state.get(
-                "agent_order_override", ""
-            )
-            order = None
-            if linked_order_id:
-                candidate_order = api_request(
-                    backend_url, "GET", f"/orders/{linked_order_id}"
-                )
-                if candidate_order["customer_id"] == ticket["customer_id"]:
-                    order = candidate_order
-                else:
-                    st.warning(
-                        "That order belongs to a different customer and was excluded."
+            thread_id = uuid.uuid4().hex
+            st.session_state["agent_thread_id"] = thread_id
+            st.session_state["agent_api_url"] = backend_url
+            st.session_state.pop("agent_reply_key", None)
+            try:
+                with st.spinner("Reading case facts and retrieving policy..."):
+                    graph = get_support_graph(backend_url)
+                    st.session_state["agent_graph_result"] = run_investigation(
+                        graph,
+                        ticket_id=int(agent_ticket_id),
+                        thread_id=thread_id,
+                        order_id=order_override.strip() or None,
+                        requested_action=action_labels[action_label],
+                        use_external_model=use_external_model,
                     )
+            except (RuntimeError, ValueError) as exc:
+                st.error(str(exc))
 
-            query = " ".join(
-                [
-                    ticket.get("subject", ""),
-                    ticket.get("message", ""),
-                    order.get("status", "") if order else "",
-                ]
-            )
-            passages = retrieve_policy(query)
-            analysis = analyze_ticket(ticket, order)
-            default_reply = local_reply(ticket, order, analysis)
-            if st.session_state.get("agent_draft_ticket_id") != ticket["id"]:
-                st.session_state["agent_reply_draft"] = default_reply
-                st.session_state["agent_draft_ticket_id"] = ticket["id"]
+        result = st.session_state.get("agent_graph_result")
+        if result:
+            ticket = result["ticket"]
+            customer = result["customer"]
+            order = result.get("order")
+            analysis = result["analysis"]
+            policies = result.get("policies", [])
+            passages = [PolicyPassage(**item) for item in policies]
+            graph_interrupts = result.get("__interrupt__", ())
+            interrupt_data = None
+            if graph_interrupts:
+                interrupt_data = getattr(
+                    graph_interrupts[0], "value", graph_interrupts[0]
+                )
 
             info_cols = st.columns(4)
             info_cols[0].metric("Ticket", f"#{ticket['id']}")
@@ -581,26 +596,23 @@ try:
                     st.warning(
                         "No policy passages were found. Treat the case as manual review."
                     )
+                trace = pd.DataFrame(result.get("tool_trace", []))
+                if not trace.empty:
+                    st.caption("Graph tool activity")
+                    show_table(trace, ["tool", "result"])
 
             with draft_col:
                 st.subheader("Customer reply draft")
-                if external_model_available():
-                    st.caption(
-                        "An approved hosted model is configured. Generating with it sends ticket text and order status to that provider."
-                    )
-                    if st.button(
-                        "Generate model-assisted draft", icon=":material/auto_awesome:"
-                    ):
-                        try:
-                            st.session_state["agent_reply_draft"] = (
-                                generate_model_reply(ticket, order, analysis, passages)
-                            )
-                            st.rerun()
-                        except RuntimeError as exc:
-                            st.error(str(exc))
+                if result.get("model_error"):
+                    st.warning(result["model_error"])
+                thread_id = st.session_state["agent_thread_id"]
+                reply_key = f"agent-reply-{thread_id}"
+                if st.session_state.get("agent_reply_key") != reply_key:
+                    st.session_state[reply_key] = result.get("draft_reply", "")
+                    st.session_state["agent_reply_key"] = reply_key
                 reply = st.text_area(
                     "Review and edit before sending",
-                    key="agent_reply_draft",
+                    key=reply_key,
                     height=200,
                     label_visibility="collapsed",
                 )
@@ -609,84 +621,56 @@ try:
                 )
 
             st.divider()
-            st.subheader("Human-approved actions")
-            action_cols = st.columns(2, gap="large")
-            with action_cols[0]:
-                if analysis["order_action"] == "record_refund_status" and order:
-                    refund_verified = st.checkbox(
+            if interrupt_data:
+                action = interrupt_data["action"]
+                st.subheader("Action approval required")
+                st.warning(action["description"])
+                finance_verified = False
+                reply_sent = False
+                if interrupt_data.get("requires_finance_verification"):
+                    finance_verified = st.checkbox(
                         "I verified the payment was issued in the finance system.",
-                        key=f"refund-verified-{ticket['id']}",
+                        key=f"finance-verified-{thread_id}",
                     )
-                    if st.button(
-                        "Record order as refunded",
-                        type="primary",
-                        disabled=not refund_verified,
-                    ):
-                        updated_order = api_request(
-                            backend_url,
-                            "PATCH",
-                            f"/orders/{order['id']}/status",
-                            json={"status": "refunded"},
-                        )
-                        st.success(
-                            f"Workflow status recorded as {updated_order['status']}; no payment was initiated."
+                if interrupt_data.get("requires_reply_confirmation"):
+                    reply_sent = st.checkbox(
+                        "I sent the reviewed reply through an approved support channel.",
+                        key=f"reply-sent-{thread_id}",
+                    )
+                approve_col, decline_col = st.columns(2)
+                if approve_col.button(
+                    "Approve action", type="primary", key=f"approve-{thread_id}"
+                ):
+                    try:
+                        graph = get_support_graph(st.session_state["agent_api_url"])
+                        st.session_state["agent_graph_result"] = resume_approved_action(
+                            graph,
+                            thread_id=thread_id,
+                            decision={
+                                "approved": True,
+                                "finance_verified": finance_verified,
+                                "reply_sent": reply_sent,
+                            },
                         )
                         st.rerun()
-                elif analysis["order_action"] == "manual_return_review":
-                    st.caption(
-                        "A staff member must complete and verify the return steps before the order can advance."
+                    except (RuntimeError, ValueError) as exc:
+                        st.error(str(exc))
+                if decline_col.button("Decline", key=f"decline-{thread_id}"):
+                    graph = get_support_graph(st.session_state["agent_api_url"])
+                    st.session_state["agent_graph_result"] = resume_approved_action(
+                        graph,
+                        thread_id=thread_id,
+                        decision={"approved": False},
                     )
-                elif analysis["order_action"] == "verify_payment_record":
-                    st.caption(
-                        "Check the finance ledger before confirming the refund to the customer."
-                    )
-                elif analysis["order_action"] == "request_order_id":
-                    st.caption(
-                        "Ask the customer for an order ID before reviewing a refund."
-                    )
-                elif order:
-                    st.caption(f"Order {order['id']} is available for staff review.")
-                else:
-                    st.caption("No order action is available for this ticket.")
+                    st.rerun()
 
-            with action_cols[1]:
-                if ticket["status"] == "open":
-                    if st.button("Take ticket", key=f"take-ticket-{ticket['id']}"):
-                        updated_ticket = api_request(
-                            backend_url,
-                            "PATCH",
-                            f"/tickets/{ticket['id']}/status",
-                            json={"status": "in_progress"},
-                        )
-                        st.session_state["agent_ticket"] = updated_ticket
-                        st.success("Ticket moved to in progress.")
-                        st.rerun()
-                elif ticket["status"] == "closed":
-                    st.info("This ticket is closed and cannot be changed.")
-                elif ticket["status"] != "resolved":
-                    st.caption(
-                        f"Ticket is currently {ticket['status'].replace('_', ' ')}."
-                    )
-
-                if ticket["status"] not in {"closed", "resolved"}:
-                    resolution_verified = st.checkbox(
-                        "I sent the reply and completed the required support work.",
-                        key=f"resolution-verified-{ticket['id']}",
-                    )
-                    if st.button(
-                        "Mark ticket resolved",
-                        disabled=not resolution_verified,
-                        key=f"resolve-ticket-{ticket['id']}",
-                    ):
-                        updated_ticket = api_request(
-                            backend_url,
-                            "PATCH",
-                            f"/tickets/{ticket['id']}/status",
-                            json={"status": "resolved"},
-                        )
-                        st.session_state["agent_ticket"] = updated_ticket
-                        st.success("Ticket marked resolved.")
-                        st.rerun()
+            action_result = result.get("action_result") or {}
+            if action_result.get("ok"):
+                st.success(
+                    "Workflow status updated. No payment was initiated and no customer message was sent."
+                )
+            elif action_result.get("detail"):
+                st.warning(action_result["detail"])
 
             case_brief = make_case_brief(
                 ticket, customer, order, analysis, reply, passages
