@@ -16,7 +16,7 @@ services:
     plan: free
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    dockerCommand: /bin/sh -c 'python -m streamlit run streamlit_app.py --server.address 0.0.0.0 --server.port "$PORT"'
+    dockerCommand: /bin/sh ./render-streamlit.sh
     envVars:
       - key: ACME_API_URL
         fromService:
